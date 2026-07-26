@@ -1,0 +1,57 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Session files (contain live auth cookies)
+.kibana-session.json
+*.session.json
+
+# HAR files (contain sensitive request/response data including auth tokens)
+*.har
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+pip-wheel-metadata/
+.installed.cfg
+lib/
+lib64/
+.venv/
+venv/
+env/
+ENV/
+
+# Playwright browser binaries
+playwright-browsers/
+
+# Debug screenshots from auth flow
+okta_debug.png
+*.png
+
+# Claude Code local settings (machine-specific)
+.claude/
+
+# Incidents (sensitive internal architecture/RCA documents)
+incidents/
+
+# OS / editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.iml
