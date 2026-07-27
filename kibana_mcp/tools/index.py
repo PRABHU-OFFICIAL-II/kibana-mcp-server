@@ -27,6 +27,43 @@ def _text(content: str) -> list:
     return [TextContent(type="text", text=content)]
 
 
+def _parse_time_window(arguments: Dict[str, Any]) -> tuple:
+    """
+    Parse time_from / time_to ISO strings (always IST from the caller) into epoch ms.
+    Returns (from_ms, to_ms) or (None, None) if not provided.
+    IST = UTC+5:30, so subtract 5h30m to get UTC epoch ms.
+    """
+    from datetime import datetime, timezone, timedelta
+    IST = timezone(timedelta(hours=5, minutes=30))
+    from_str = arguments.get("time_from")
+    to_str = arguments.get("time_to")
+    if not from_str or not to_str:
+        return None, None
+    try:
+        def _to_ms(s: str) -> int:
+            s = s.strip()
+            # Try parsing with timezone info first
+            for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z",
+                        "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S.%f%z"):
+                try:
+                    dt = datetime.strptime(s, fmt)
+                    return int(dt.timestamp() * 1000)
+                except ValueError:
+                    pass
+            # No timezone info — assume IST
+            for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f",
+                        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+                try:
+                    dt = datetime.strptime(s, fmt).replace(tzinfo=IST)
+                    return int(dt.timestamp() * 1000)
+                except ValueError:
+                    pass
+            raise ValueError(f"Cannot parse time: {s}")
+        return _to_ms(from_str), _to_ms(to_str)
+    except Exception:
+        return None, None
+
+
 def register_tools(server: Server) -> None:
 
     @server.call_tool()
@@ -141,16 +178,42 @@ def register_tools(server: Server) -> None:
 
         elif name == "search_logs":
             range_min = arguments.get("range_minutes", 60)
-            to_ms = int(time.time() * 1000)
-            from_ms = to_ms - range_min * 60 * 1000
-            result = await search_logs(
-                index_pattern=arguments["index_pattern"],
-                kql=arguments.get("kql", "*"),
-                from_ms=from_ms,
-                to_ms=to_ms,
-                size=arguments.get("size", 100),
-                sort_order=arguments.get("sort_order", "desc"),
-            )
+            kql_str = arguments.get("kql", "*")
+            now_ms = int(time.time() * 1000)
+            # If the KQL contains explicit @timestamp filters, don't let range_minutes
+            # create a conflicting ES range clause — set the range fence wide open so
+            # only the KQL timestamps control what documents are returned.
+            if "@timestamp" in kql_str:
+                from_ms = 0
+                to_ms = now_ms + 86_400_000  # +1 day buffer for any timezone edge
+            else:
+                from_ms = now_ms - range_min * 60 * 1000
+                to_ms = now_ms
+            sl_space = arguments.get("space")
+            if sl_space:
+                from kibana_mcp.config import config as _cfg
+                _orig_sl = _cfg.kibana.space_id
+                _cfg.kibana.space_id = sl_space
+                try:
+                    result = await search_logs(
+                        index_pattern=arguments["index_pattern"],
+                        kql=kql_str,
+                        from_ms=from_ms,
+                        to_ms=to_ms,
+                        size=arguments.get("size", 100),
+                        sort_order=arguments.get("sort_order", "desc"),
+                    )
+                finally:
+                    _cfg.kibana.space_id = _orig_sl
+            else:
+                result = await search_logs(
+                    index_pattern=arguments["index_pattern"],
+                    kql=kql_str,
+                    from_ms=from_ms,
+                    to_ms=to_ms,
+                    size=arguments.get("size", 100),
+                    sort_order=arguments.get("sort_order", "desc"),
+                )
             hits = result.get("hits", {})
             total = hits.get("total", {})
             total_count = total.get("value", 0) if isinstance(total, dict) else total
@@ -172,7 +235,17 @@ def register_tools(server: Server) -> None:
             return _text("\n".join(lines))
 
         elif name == "run_esql":
-            result = await run_esql(arguments["query"])
+            esql_space = arguments.get("space")
+            if esql_space:
+                from kibana_mcp.config import config as _cfg
+                _orig = _cfg.kibana.space_id
+                _cfg.kibana.space_id = esql_space
+                try:
+                    result = await run_esql(arguments["query"])
+                finally:
+                    _cfg.kibana.space_id = _orig
+            else:
+                result = await run_esql(arguments["query"])
             columns = result.get("columns", [])
             rows = result.get("values", [])
             col_names = [c.get("name", "") for c in columns]
@@ -233,6 +306,7 @@ def register_tools(server: Server) -> None:
         # ── Investigation / Scenario tools ────────────────────────────────────
 
         elif name == "search_service_logs":
+            f_ms, t_ms = _parse_time_window(arguments)
             output = await search_service_logs(
                 service=arguments["service"],
                 kql=arguments.get("kql"),
@@ -243,29 +317,38 @@ def register_tools(server: Server) -> None:
                 org=arguments.get("org"),
                 namespace=arguments.get("namespace"),
                 cluster=arguments.get("cluster"),
+                from_ms=f_ms,
+                to_ms=t_ms,
             )
             return _text(output)
 
         elif name == "investigate_service_errors":
+            f_ms, t_ms = _parse_time_window(arguments)
             output = await investigate_service_errors(
                 service=arguments["service"],
                 range_minutes=arguments.get("range_minutes", 60),
                 size=arguments.get("size", 100),
                 space=arguments.get("space"),
                 org=arguments.get("org"),
+                from_ms=f_ms,
+                to_ms=t_ms,
             )
             return _text(output)
 
         elif name == "trace_request":
+            f_ms, t_ms = _parse_time_window(arguments)
             output = await trace_request(
                 reqid=arguments["reqid"],
                 range_minutes=arguments.get("range_minutes", 60),
                 size=arguments.get("size", 200),
                 space=arguments.get("space"),
+                from_ms=f_ms,
+                to_ms=t_ms,
             )
             return _text(output)
 
         elif name == "search_by_org":
+            f_ms, t_ms = _parse_time_window(arguments)
             output = await search_by_org(
                 org_id=arguments["org_id"],
                 kql_extra=arguments.get("kql"),
@@ -273,6 +356,8 @@ def register_tools(server: Server) -> None:
                 size=arguments.get("size", 100),
                 space=arguments.get("space"),
                 service=arguments.get("service"),
+                from_ms=f_ms,
+                to_ms=t_ms,
             )
             return _text(output)
 
@@ -465,19 +550,26 @@ def register_tools(server: Server) -> None:
 
             # ── Search ────────────────────────────────────────────────────────
             Tool(name="search_logs",
-                 description="Search logs in an Elasticsearch index using KQL. Returns matching log lines.",
+                 description=(
+                     "Search logs in an Elasticsearch index using KQL. Returns matching log lines. "
+                     "If your KQL contains explicit @timestamp filters (e.g. @timestamp >= '2026-07-23T08:36:00Z'), "
+                     "the range_minutes parameter is ignored and the KQL timestamps control the window. "
+                     "Always use Z-suffix UTC timestamps in KQL (e.g. '2026-07-23T08:36:00Z')."
+                 ),
                  inputSchema={"type": "object", "properties": {
                      "index_pattern": {"type": "string", "description": "Index or data stream to search (e.g. 'filebeat-*-intcloud-*')"},
                      "kql": {"type": "string", "description": "KQL query (e.g. 'service.name: my-app AND log.level: error')", "default": "*"},
-                     "range_minutes": {"type": "number", "default": 60},
+                     "range_minutes": {"type": "number", "default": 60, "description": "How far back to search. Ignored if KQL contains @timestamp filters."},
                      "size": {"type": "number", "default": 100, "description": "Max number of results"},
                      "sort_order": {"type": "string", "enum": ["desc", "asc"], "default": "desc"},
+                     "space": {"type": "string", "enum": ["gcs", "cai"], "description": "Kibana space to search in (omit to use configured default)"},
                  }, "required": ["index_pattern"]}),
 
             Tool(name="run_esql",
                  description="Run an ES|QL query against Elasticsearch (requires ES 8.11+).",
                  inputSchema={"type": "object", "properties": {
                      "query": {"type": "string", "description": "ES|QL query string"},
+                     "space": {"type": "string", "enum": ["gcs", "cai"], "description": "Kibana space to run the query in (omit for default)"},
                  }, "required": ["query"]}),
 
             # ── Alerts ────────────────────────────────────────────────────────
@@ -508,28 +600,33 @@ def register_tools(server: Server) -> None:
                      "Primary debugging tool: search logs for a specific microservice. "
                      "Filters by kubernetes.labels.app. Optionally narrow by log level, org/tenant, "
                      "K8s namespace, cluster, or a custom KQL expression. "
-                     "Auto-routes to the right Kibana space (gcs for CDI, cai for CAI) or searches both."
+                     "Auto-routes to the right Kibana space (gcs for CDI, cai for CAI) or searches both. "
+                     "Use time_from/time_to (IST) for a precise historical window; otherwise range_minutes from now."
                  ),
                  inputSchema={"type": "object", "properties": {
                      "service": {"type": "string", "description": "Microservice name (kubernetes.labels.app), e.g. 'vcs', 'migration', 'cai-run'"},
-                     "kql": {"type": "string", "description": "Additional KQL filter, e.g. 'message: \"import job\"'"},
-                     "level": {"type": "string", "enum": ["ERROR", "WARN", "INFO", "DEBUG"], "description": "Log level filter"},
-                     "range_minutes": {"type": "number", "default": 60, "description": "How far back to search"},
+                     "kql": {"type": "string", "description": "Additional KQL filter"},
+                     "level": {"type": "string", "enum": ["ERROR", "WARN", "INFO", "DEBUG"]},
+                     "range_minutes": {"type": "number", "default": 60, "description": "How far back from now (ignored if time_from/time_to set)"},
+                     "time_from": {"type": "string", "description": "Window start in IST, e.g. '2026-07-23 14:06:00'. Takes priority over range_minutes."},
+                     "time_to": {"type": "string", "description": "Window end in IST, e.g. '2026-07-23 14:06:30'."},
                      "size": {"type": "number", "default": 100},
-                     "space": {"type": "string", "enum": ["gcs", "cai"], "description": "Force a specific Kibana space (omit to auto-detect)"},
-                     "org": {"type": "string", "description": "Filter by tenant/org ID (dissect.catalina_out.org)"},
-                     "namespace": {"type": "string", "description": "Filter by K8s namespace, e.g. 'iics-prod-nause6'"},
-                     "cluster": {"type": "string", "description": "Filter by cluster, e.g. 'use6', 'use1'"},
+                     "space": {"type": "string", "enum": ["gcs", "cai"]},
+                     "org": {"type": "string", "description": "Filter by tenant/org ID"},
+                     "namespace": {"type": "string", "description": "Filter by K8s namespace"},
+                     "cluster": {"type": "string", "description": "Filter by cluster, e.g. 'use6'"},
                  }, "required": ["service"]}),
 
             Tool(name="investigate_service_errors",
                  description=(
-                     "Find recent ERROR and WARN log lines and exceptions for a microservice. "
-                     "Use this as a first step when debugging a service issue or alert."
+                     "Find ERROR and WARN log lines and exceptions for a microservice. "
+                     "Use time_from/time_to (IST) for a precise historical window."
                  ),
                  inputSchema={"type": "object", "properties": {
                      "service": {"type": "string", "description": "Microservice name (kubernetes.labels.app)"},
-                     "range_minutes": {"type": "number", "default": 60},
+                     "range_minutes": {"type": "number", "default": 60, "description": "Ignored if time_from/time_to set"},
+                     "time_from": {"type": "string", "description": "Window start in IST, e.g. '2026-07-23 14:06:00'"},
+                     "time_to": {"type": "string", "description": "Window end in IST, e.g. '2026-07-23 14:06:30'"},
                      "size": {"type": "number", "default": 100},
                      "space": {"type": "string", "enum": ["gcs", "cai"]},
                      "org": {"type": "string", "description": "Filter by tenant/org ID"},
@@ -539,25 +636,32 @@ def register_tools(server: Server) -> None:
                  description=(
                      "Trace a request ID (reqid) across all services to reconstruct the full call chain. "
                      "Searches dissect.catalina_out.reqid and message fields. "
-                     "Results are returned in chronological order showing how the request flowed between services."
+                     "Results are returned in chronological order. "
+                     "Use time_from/time_to (IST) when the request happened at a known time in the past."
                  ),
                  inputSchema={"type": "object", "properties": {
-                     "reqid": {"type": "string", "description": "Request/correlation ID from the log context block, e.g. '8WX4wCZJyMMbqWYaAWvGWU'"},
-                     "range_minutes": {"type": "number", "default": 60},
+                     "reqid": {"type": "string", "description": "Request/correlation ID, e.g. '8WX4wCZJyMMbqWYaAWvGWU'"},
+                     "range_minutes": {"type": "number", "default": 60, "description": "Ignored if time_from/time_to set"},
+                     "time_from": {"type": "string", "description": "Window start in IST"},
+                     "time_to": {"type": "string", "description": "Window end in IST"},
                      "size": {"type": "number", "default": 200},
-                     "space": {"type": "string", "enum": ["gcs", "cai"], "description": "Omit to search both spaces"},
+                     "space": {"type": "string", "enum": ["gcs", "cai"]},
                  }, "required": ["reqid"]}),
 
             Tool(name="search_by_org",
                  description=(
-                     "Search all logs for a specific tenant/org ID. Useful for debugging customer-reported issues. "
-                     "Optionally narrow by service name or additional KQL."
+                     "Search all logs for a specific tenant/org ID. Searches the full message text so it "
+                     "finds all log formats: CDI catalina logs (dissect.catalina_out.org), "
+                     "CAI/Azure logs (TenantId=...), and any other format that embeds the org ID. "
+                     "Use time_from/time_to (IST) for a precise historical window."
                  ),
                  inputSchema={"type": "object", "properties": {
-                     "org_id": {"type": "string", "description": "Org/tenant ID from dissect.catalina_out.org, e.g. '0Cr2nEhbUQ5gNM3R5EpLoj'"},
+                     "org_id": {"type": "string", "description": "Org/tenant ID, e.g. '30gkAqkWMvmjJOwn2w5IkT'"},
                      "service": {"type": "string", "description": "Optionally narrow to a specific service"},
-                     "kql": {"type": "string", "description": "Additional KQL filter"},
-                     "range_minutes": {"type": "number", "default": 60},
+                     "kql": {"type": "string", "description": "Additional KQL filter, e.g. 'error'"},
+                     "range_minutes": {"type": "number", "default": 60, "description": "Ignored if time_from/time_to set"},
+                     "time_from": {"type": "string", "description": "Window start in IST, e.g. '2026-07-23 14:06:00'"},
+                     "time_to": {"type": "string", "description": "Window end in IST, e.g. '2026-07-23 14:06:30'"},
                      "size": {"type": "number", "default": 100},
                      "space": {"type": "string", "enum": ["gcs", "cai"]},
                  }, "required": ["org_id"]}),

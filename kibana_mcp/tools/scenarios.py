@@ -37,6 +37,17 @@ def _range_ms(range_minutes: int) -> Tuple[int, int]:
     return to_ms - range_minutes * 60 * 1000, to_ms
 
 
+def _resolve_time_range(
+    range_minutes: int,
+    from_ms: Optional[int],
+    to_ms: Optional[int],
+) -> Tuple[int, int]:
+    """Return (from_ms, to_ms). Explicit epoch-ms values take priority over range_minutes."""
+    if from_ms is not None and to_ms is not None:
+        return from_ms, to_ms
+    return _range_ms(range_minutes)
+
+
 def _format_hit(doc: dict) -> str:
     src = doc.get("_source", {})
     fields = doc.get("fields", {})
@@ -140,9 +151,11 @@ async def investigate_service_errors(
     size: int = 100,
     space: Optional[str] = None,
     org: Optional[str] = None,
+    from_ms: Optional[int] = None,
+    to_ms: Optional[int] = None,
 ) -> str:
     """Find recent ERROR/EXCEPTION log lines for a specific microservice."""
-    from_ms, to_ms = _range_ms(range_minutes)
+    from_ms, to_ms = _resolve_time_range(range_minutes, from_ms, to_ms)
     chosen_space = _pick_space(service, space)
 
     kql_parts = [
@@ -150,7 +163,7 @@ async def investigate_service_errors(
         '(dissect.catalina_out.level: "ERROR" OR dissect.catalina_out.level: "WARN" OR message: "*Exception*" OR message: "*ERROR*")',
     ]
     if org:
-        kql_parts.append(f'dissect.catalina_out.org: "{org}"')
+        kql_parts.append(f'"{org}"')
     kql = " AND ".join(kql_parts)
 
     if chosen_space:
@@ -163,7 +176,7 @@ async def investigate_service_errors(
 
     lines = [
         f"Service error investigation: {service}",
-        f"Time range: last {range_minutes} minutes",
+        f"Time range: {from_ms} — {to_ms} (epoch ms)",
         f"Spaces: {', '.join(spaces_searched)}",
         "",
     ]
@@ -183,9 +196,11 @@ async def trace_request(
     range_minutes: int = 60,
     size: int = 200,
     space: Optional[str] = None,
+    from_ms: Optional[int] = None,
+    to_ms: Optional[int] = None,
 ) -> str:
     """Trace a request ID across all services to reconstruct the full call chain."""
-    from_ms, to_ms = _range_ms(range_minutes)
+    from_ms, to_ms = _resolve_time_range(range_minutes, from_ms, to_ms)
 
     # reqid appears in the structured context block in the message field
     kql = f'dissect.catalina_out.reqid: "{reqid}" OR message: "{reqid}"'
@@ -225,7 +240,7 @@ async def trace_request(
 
     lines = [
         f"Request trace: {reqid}",
-        f"Time range: last {range_minutes} minutes",
+        f"Time range: {from_ms} — {to_ms} (epoch ms)",
         f"Total events: {len(all_docs)}",
         "",
     ]
@@ -252,11 +267,17 @@ async def search_by_org(
     size: int = 100,
     space: Optional[str] = None,
     service: Optional[str] = None,
+    from_ms: Optional[int] = None,
+    to_ms: Optional[int] = None,
 ) -> str:
     """Search all logs for a specific tenant/org ID, optionally narrowed by service or KQL."""
-    from_ms, to_ms = _range_ms(range_minutes)
+    from_ms, to_ms = _resolve_time_range(range_minutes, from_ms, to_ms)
 
-    kql_parts = [f'dissect.catalina_out.org: "{org_id}"']
+    # Plain quoted full-text match — org ID appears differently per log source:
+    # CDI catalina: dissect.catalina_out.org
+    # CAI / Azure SB: TenantId=<id> in message field
+    # Both are caught by a plain quoted full-text search on the message.
+    kql_parts = [f'"{org_id}"']
     if service:
         kql_parts.append(f'kubernetes.labels.app: "{service}"')
     if kql_extra:
@@ -271,7 +292,7 @@ async def search_by_org(
 
     lines = [
         f"Org search: {org_id}",
-        f"Time range: last {range_minutes} minutes",
+        f"Time range: {from_ms} — {to_ms} (epoch ms)",
         "",
     ]
     for sp, result in results_by_space.items():
@@ -391,19 +412,21 @@ async def search_service_logs(
     org: Optional[str] = None,
     namespace: Optional[str] = None,
     cluster: Optional[str] = None,
+    from_ms: Optional[int] = None,
+    to_ms: Optional[int] = None,
 ) -> str:
     """
     General-purpose service log search — the primary debugging entry point.
     Filters by service (kubernetes.labels.app), optionally by level, org, namespace, cluster.
     """
-    from_ms, to_ms = _range_ms(range_minutes)
+    from_ms, to_ms = _resolve_time_range(range_minutes, from_ms, to_ms)
     chosen_space = _pick_space(service, space)
 
     kql_parts = [f'kubernetes.labels.app: "{service}"']
     if level:
         kql_parts.append(f'dissect.catalina_out.level: "{level.upper()}"')
     if org:
-        kql_parts.append(f'dissect.catalina_out.org: "{org}"')
+        kql_parts.append(f'"{org}"')
     if namespace:
         kql_parts.append(f'kubernetes.namespace: "{namespace}"')
     if cluster:
