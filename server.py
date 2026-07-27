@@ -11,7 +11,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), overrid
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
-from kibana_mcp.auth.manager import get_session, SessionExpiredError
+from kibana_mcp.auth.manager import get_session
 from kibana_mcp.config import config
 from kibana_mcp.tools.index import register_tools
 
@@ -24,9 +24,9 @@ async def warm_up_session() -> None:
     try:
         session = await get_session()
         expires_in = round((session.expires_at - __import__("time").time() * 1000) / 60000)
-        print(f"[kibana-mcp] Session loaded, expires in {expires_in} minutes", file=sys.stderr)
-    except SessionExpiredError:
-        print("[kibana-mcp] No active session — call inject_session tool to authenticate", file=sys.stderr)
+        print(f"[kibana-mcp] Session ready, expires in {expires_in} minutes", file=sys.stderr)
+    except Exception as e:
+        print(f"[kibana-mcp] ⚠️  Session setup failed: {e}", file=sys.stderr)
 
 
 async def start_stdio() -> None:

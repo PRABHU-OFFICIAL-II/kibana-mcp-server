@@ -71,7 +71,7 @@ def register_tools(server: Server) -> None:
         try:
             return await _dispatch(name, arguments)
         except SessionExpiredError:
-            return _text("Session expired. Use inject_session or login tool to re-authenticate.")
+            return _text("⚠️ Could not establish a Kibana session — browser login may have been closed or timed out.")
         except NotImplementedError as e:
             return _text(f"Not yet implemented: {e}")
         except RuntimeError as e:
@@ -84,11 +84,7 @@ def register_tools(server: Server) -> None:
         # ── Auth ──────────────────────────────────────────────────────────────
 
         if name == "login":
-            username = arguments.get("username") or config.kibana.username
-            password = arguments.get("password") or config.kibana.password
-            if not username or not password:
-                return _text("Username and password required. Pass as arguments or set KIBANA_USERNAME / KIBANA_PASSWORD env vars.")
-            s = await init_session(username, password)
+            s = await init_session()
             from datetime import datetime, timezone
             exp = datetime.fromtimestamp(s.expires_at / 1000, tz=timezone.utc).isoformat()
             return _text(f"Logged in via Okta SAML. Cookie: {s.cookie_name}. Expires at {exp}")
@@ -502,11 +498,8 @@ def register_tools(server: Server) -> None:
         return [
             # ── Auth ──────────────────────────────────────────────────────────
             Tool(name="login",
-                 description="Log in to Kibana via Okta SSO (SAML). Launches a headless Playwright browser — approve the Okta Verify push on your phone.",
-                 inputSchema={"type": "object", "properties": {
-                     "username": {"type": "string", "description": "Okta username (or set KIBANA_USERNAME env var)"},
-                     "password": {"type": "string", "description": "Okta password (or set KIBANA_PASSWORD env var)"},
-                 }}),
+                 description="Opens a browser window — sign in with Okta and approve the push. No credentials needed.",
+                 inputSchema={"type": "object", "properties": {}}),
 
             Tool(name="inject_session",
                  description="Inject a Kibana session cookie obtained from browser DevTools or a HAR file.",

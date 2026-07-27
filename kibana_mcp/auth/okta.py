@@ -59,16 +59,24 @@ async def _get_saml_redirect_url_via_browser(page) -> str:
     return redirect
 
 
-async def login_with_okta(username: str, password: str) -> Session:
+async def login_with_okta() -> Session:
+    """Open a visible browser window for the user to complete Okta login manually.
+
+    No credentials are passed — the user types them in the real browser and
+    approves the Okta Verify push themselves. The SAML relay-state cookie is
+    established via an in-browser fetch before the user is handed control.
+    Once they land on Kibana, we capture the session and Okta cookies so
+    silent refresh can take over.
+    """
     from playwright.async_api import async_playwright
 
-    print("[auth] Starting Okta SAML login flow (headless browser)...", file=sys.stderr)
-    headless = os.environ.get("OKTA_HEADLESS", "true").lower() not in ("false", "0", "no")
+    print("[auth] Opening browser for Okta SAML login — complete sign-in in the window that appears...", file=sys.stderr)
     okta_domain = config.okta.org.rstrip("/").split("//")[-1]
 
     async with async_playwright() as p:
+        # Always visible — this is the whole point. User drives the login.
         browser = await p.chromium.launch(
-            headless=headless,
+            headless=False,
             args=["--disable-blink-features=AutomationControlled"],
         )
         try:
@@ -90,40 +98,19 @@ async def login_with_okta(username: str, password: str) -> Session:
             print("[auth] Loading Kibana login page to establish browser origin...", file=sys.stderr)
             await page.goto(f"{config.kibana.base_url}/login", wait_until="domcontentloaded", timeout=30_000)
 
-            # Step 2: call /internal/security/login from inside the browser
+            # Step 2: call /internal/security/login from inside the browser to set relay-state cookie
             print("[auth] Initiating SAML redirect from browser context...", file=sys.stderr)
             okta_url = await _get_saml_redirect_url_via_browser(page)
             print(f"[auth] Navigating to Okta: {okta_url[:80]}...", file=sys.stderr)
 
-            # Step 3: navigate the browser to Okta
+            # Step 3: navigate the browser to Okta — user takes over from here
             await page.goto(okta_url, wait_until="domcontentloaded", timeout=30_000)
-            print(f"[auth] On Okta: {page.url}", file=sys.stderr)
+            print(f"[auth] Browser opened on Okta — waiting for you to sign in and approve the push...", file=sys.stderr)
+            print("[auth] Sign in and approve the Okta Verify push, then this will continue automatically.", file=sys.stderr)
 
-            print("[auth] Filling username...", file=sys.stderr)
-            username_field = page.locator('input[name="identifier"], #okta-signin-username').first
-            await username_field.wait_for(state="visible", timeout=15_000)
-            await username_field.fill(username)
-            await asyncio.sleep(0.5)
-            await page.locator('[type="submit"]').first.click()
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-            print("[auth] Username submitted", file=sys.stderr)
-
-            print("[auth] Waiting for password field...", file=sys.stderr)
-            password_field = page.locator('input[type="password"]').first
-            await password_field.wait_for(state="visible", timeout=15_000)
-            await password_field.fill(password)
-            await asyncio.sleep(0.5)
-            await page.locator('[type="submit"]').first.click()
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-            print("[auth] Password submitted", file=sys.stderr)
-
-            # After password, Okta may show an authenticator selection screen
-            # Try to select Okta Verify push; if not shown, push may be auto-sent
-            await _select_push_notification(page)
-
-            print("[auth] Okta Verify push sent — please approve on your phone...", file=sys.stderr)
-            await _wait_for_kibana_landing(page, okta_domain)
-            print("[auth] Redirected back to Kibana — login successful", file=sys.stderr)
+            # Wait up to 5 minutes for the user to complete the full login flow
+            await _wait_for_kibana_landing(page, okta_domain, timeout=300.0)
+            print("[auth] Login detected — capturing session cookies...", file=sys.stderr)
 
             kibana_cookies = await context.cookies(config.kibana.base_url)
             okta_cookies = await context.cookies(config.okta.org)
@@ -192,9 +179,9 @@ async def _select_push_notification(page) -> None:
     print("[auth] No authenticator selector found — assuming push was sent automatically", file=sys.stderr)
 
 
-async def _wait_for_kibana_landing(page, okta_domain: str) -> None:
+async def _wait_for_kibana_landing(page, okta_domain: str, timeout: float = PUSH_POLL_TIMEOUT) -> None:
     """Wait for Playwright to land back on Kibana after Okta push approval."""
-    print(f"[auth] Waiting up to {int(PUSH_POLL_TIMEOUT)}s for push approval...", file=sys.stderr)
+    print(f"[auth] Waiting up to {round(timeout / 60)} minutes for login completion...", file=sys.stderr)
     print(f"[auth] Current page before wait: {page.url}", file=sys.stderr)
 
     # Listen for navigations to debug where the browser goes
@@ -207,7 +194,7 @@ async def _wait_for_kibana_landing(page, okta_domain: str) -> None:
     try:
         await page.wait_for_url(
             lambda url: url.startswith(config.kibana.base_url),
-            timeout=PUSH_POLL_TIMEOUT * 1000,
+            timeout=timeout * 1000,
         )
     except Exception as wait_err:
         url = page.url
@@ -221,8 +208,7 @@ async def _wait_for_kibana_landing(page, okta_domain: str) -> None:
             pass
         if not url.startswith(config.kibana.base_url):
             raise RuntimeError(
-                f"Okta Verify push timed out after {int(PUSH_POLL_TIMEOUT)}s — "
-                "make sure you approved the push notification on your phone"
+                f"Login timed out after {round(timeout / 60)} minutes — please try again"
             )
 
     print(f"[auth] Back on Kibana: {page.url}", file=sys.stderr)
