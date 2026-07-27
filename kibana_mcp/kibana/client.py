@@ -5,6 +5,15 @@ import httpx
 from kibana_mcp.auth.manager import get_session, SessionExpiredError
 from kibana_mcp.config import config
 
+_client: Optional[httpx.AsyncClient] = None
+
+
+def _get_client() -> httpx.AsyncClient:
+    global _client
+    if _client is None:
+        _client = httpx.AsyncClient(verify=config.kibana.tls_verify, timeout=60.0)
+    return _client
+
 
 async def _headers() -> dict:
     base = {
@@ -25,8 +34,7 @@ async def _headers() -> dict:
 async def kibana_get(path: str, params: Optional[dict] = None) -> Any:
     headers = await _headers()
     url = f"{config.kibana.base_url}{path}"
-    async with httpx.AsyncClient(verify=config.kibana.tls_verify, timeout=30) as client:
-        resp = await client.get(url, headers=headers, params=params)
+    resp = await _get_client().get(url, headers=headers, params=params)
     _check_response(resp, path)
     return resp.json()
 
@@ -34,8 +42,7 @@ async def kibana_get(path: str, params: Optional[dict] = None) -> Any:
 async def kibana_post(path: str, body: Any) -> Any:
     headers = await _headers()
     url = f"{config.kibana.base_url}{path}"
-    async with httpx.AsyncClient(verify=config.kibana.tls_verify, timeout=60) as client:
-        resp = await client.post(url, headers=headers, json=body)
+    resp = await _get_client().post(url, headers=headers, json=body)
     _check_response(resp, path)
     return resp.json()
 
@@ -44,8 +51,7 @@ async def es_post(path: str, body: Any) -> Any:
     """Direct Elasticsearch API call proxied through Kibana."""
     headers = await _headers()
     url = f"{config.kibana.base_url}{path}"
-    async with httpx.AsyncClient(verify=config.kibana.tls_verify, timeout=60) as client:
-        resp = await client.post(url, headers=headers, json=body)
+    resp = await _get_client().post(url, headers=headers, json=body)
     _check_response(resp, path)
     return resp.json()
 

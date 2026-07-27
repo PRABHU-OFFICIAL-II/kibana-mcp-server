@@ -26,16 +26,12 @@ async def get_session() -> Session:
 
     now_ms = int(time.time() * 1000)
     if _current.expires_at < now_ms:
-        print("[auth] Session expired — attempting silent refresh...", file=sys.stderr)
-        from kibana_mcp.auth.okta import try_silent_refresh
-        refreshed = await try_silent_refresh(_current)
-        if refreshed:
-            _current = refreshed
-            _schedule_refresh(_current)
-            return _current
+        # Never block the call — raise immediately so the MCP server stays responsive.
+        # User must call the login or inject_session tool to re-authenticate.
         raise SessionExpiredError()
 
     if should_refresh(_current):
+        # Session is still valid but approaching expiry — refresh in background, don't block.
         snapshot = _current
         asyncio.ensure_future(_background_refresh(snapshot))
     else:

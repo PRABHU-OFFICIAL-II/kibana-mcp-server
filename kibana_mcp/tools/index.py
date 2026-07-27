@@ -11,6 +11,7 @@ from kibana_mcp.kibana.api import (
     list_spaces, list_dashboards, get_dashboard, list_data_views, get_data_view,
     search_logs, run_esql, get_alert_rules, get_active_alerts,
     get_apm_services, list_ml_jobs,
+    count_by_field, get_log_histogram, get_context_around, list_fields,
 )
 from kibana_mcp.tools.scenarios import (
     investigate_service_errors,
@@ -293,6 +294,121 @@ def register_tools(server: Server) -> None:
             )
             return _text(output)
 
+        # ── Utility tools (borrowed from community impl) ──────────────────────
+
+        elif name == "get_log_context":
+            range_min = arguments.get("range_minutes", 60)
+            to_ms = int(time.time() * 1000)
+            from_ms = to_ms - range_min * 60 * 1000
+            result = await get_context_around(
+                index_pattern=arguments.get("index_pattern", "filebeat-*-intcloud-*"),
+                timestamp=arguments["timestamp"],
+                before=arguments.get("before", 20),
+                after=arguments.get("after", 20),
+                service=arguments.get("service"),
+                space=arguments.get("space"),
+            )
+            before_hits = result["before"]
+            after_hits = result["after"]
+            pivot = result["pivot"]
+            lines = []
+            if before_hits:
+                lines.append(f"=== {len(before_hits)} entries BEFORE {pivot} ===")
+                for doc in before_hits:
+                    src = doc.get("_source", {})
+                    ts = src.get("@timestamp", "")
+                    msg = src.get("dissect.catalina_out.message") or src.get("message", "")
+                    svc = src.get("kubernetes.labels.app", "")
+                    lvl = src.get("dissect.catalina_out.level", "")
+                    lines.append(f"  [{ts}] [{lvl}] [{svc}] {str(msg).strip()[:300]}")
+            lines.append(f"\n=== PIVOT: {pivot} ===\n")
+            if after_hits:
+                lines.append(f"=== {len(after_hits)} entries AFTER {pivot} ===")
+                for doc in after_hits:
+                    src = doc.get("_source", {})
+                    ts = src.get("@timestamp", "")
+                    msg = src.get("dissect.catalina_out.message") or src.get("message", "")
+                    svc = src.get("kubernetes.labels.app", "")
+                    lvl = src.get("dissect.catalina_out.level", "")
+                    lines.append(f"  [{ts}] [{lvl}] [{svc}] {str(msg).strip()[:300]}")
+            return _text("\n".join(lines) if lines else "No log entries found around that timestamp.")
+
+        elif name == "count_by_field":
+            range_min = arguments.get("range_minutes", 60)
+            to_ms = int(time.time() * 1000)
+            from_ms = to_ms - range_min * 60 * 1000
+            result = await count_by_field(
+                index_pattern=arguments.get("index_pattern", "filebeat-*-intcloud-*"),
+                field=arguments["field"],
+                from_ms=from_ms,
+                to_ms=to_ms,
+                size=min(int(arguments.get("max_buckets", 20)), 100),
+                service=arguments.get("service"),
+                level=arguments.get("level"),
+                space=arguments.get("space"),
+            )
+            buckets = result.get("aggregations", {}).get("by_field", {}).get("buckets", [])
+            if not buckets:
+                return _text(f"No values found for field '{arguments['field']}'.")
+            lines = [f"{'Value':<60} {'Count':>10}", "─" * 72]
+            for b in buckets:
+                key = str(b["key"])[:57] + "..." if len(str(b["key"])) > 60 else str(b["key"])
+                lines.append(f"{key:<60} {b['doc_count']:>10,}")
+            lines += ["─" * 72, f"{'Total (shown)':<60} {sum(b['doc_count'] for b in buckets):>10,}"]
+            return _text("\n".join(lines))
+
+        elif name == "log_histogram":
+            range_min = arguments.get("range_minutes", 360)
+            to_ms = int(time.time() * 1000)
+            from_ms = to_ms - range_min * 60 * 1000
+            interval = arguments.get("interval", "30m")
+            result = await get_log_histogram(
+                index_pattern=arguments.get("index_pattern", "filebeat-*-intcloud-*"),
+                from_ms=from_ms,
+                to_ms=to_ms,
+                interval=interval,
+                service=arguments.get("service"),
+                level=arguments.get("level"),
+                kql=arguments.get("kql"),
+                space=arguments.get("space"),
+            )
+            buckets = result.get("aggregations", {}).get("over_time", {}).get("buckets", [])
+            if not buckets:
+                return _text("No data found for the requested time range.")
+            max_count = max(b["doc_count"] for b in buckets) or 1
+            bar_width = 40
+            lines = [f"Log volume over time (interval: {interval})", "=" * 70]
+            for b in buckets:
+                ts = str(b.get("key_as_string", b.get("key", "?")))[:19]
+                count = b["doc_count"]
+                bar = "█" * int(count / max_count * bar_width)
+                lines.append(f"{ts}  {bar:<{bar_width}} {count:>6,}")
+            total = sum(b["doc_count"] for b in buckets)
+            lines.append(f"\nTotal: {total:,} entries across {len(buckets)} buckets")
+            return _text("\n".join(lines))
+
+        elif name == "list_fields":
+            result = await list_fields(
+                index_pattern=arguments.get("index_pattern", "filebeat-*-intcloud-*"),
+                filter_pattern=arguments.get("filter_pattern"),
+                popular_only=arguments.get("popular_only", True),
+                space=arguments.get("space"),
+            )
+            source = result.get("source", "")
+            if source == "sample":
+                fields_list = result.get("fields", [])
+                lines = [f"Fields from 50 recent docs ({len(fields_list)} total):"]
+                lines += [f"  {f}" for f in fields_list]
+                lines.append("\n_Run with popular_only=false for full field_caps scan._")
+                return _text("\n".join(lines))
+            else:
+                fields_dict = result.get("fields", {})
+                lines = [f"{'Field':<60} {'Types'}", "─" * 80]
+                for fname, types in fields_dict.items():
+                    lines.append(f"{fname:<60} {', '.join(types)}")
+                lines.append(f"\n{len(fields_dict)} fields")
+                return _text("\n".join(lines))
+
         else:
             return _text(f"Unknown tool: {name}")
 
@@ -470,4 +586,67 @@ def register_tools(server: Server) -> None:
                      "comparison_minutes": {"type": "number", "default": 60, "description": "Duration of comparison (recent) window in minutes"},
                      "space": {"type": "string", "enum": ["gcs", "cai"]},
                  }, "required": ["service"]}),
+
+            # ── Utility tools ─────────────────────────────────────────────────
+            Tool(name="get_log_context",
+                 description=(
+                     "Fetch N log entries immediately before and after a specific timestamp. "
+                     "Use this to understand what led up to an error and what happened afterwards. "
+                     "Provide the exact ISO 8601 timestamp from a log entry (e.g. from investigate_service_errors output)."
+                 ),
+                 inputSchema={"type": "object", "properties": {
+                     "timestamp": {"type": "string", "description": "ISO 8601 pivot timestamp, e.g. '2024-01-15T10:45:30.123Z'"},
+                     "index_pattern": {"type": "string", "default": "filebeat-*-intcloud-*"},
+                     "service": {"type": "string", "description": "Restrict context to a specific service (optional)"},
+                     "before": {"type": "number", "default": 20, "description": "Entries to fetch before the timestamp"},
+                     "after": {"type": "number", "default": 20, "description": "Entries to fetch after the timestamp"},
+                     "space": {"type": "string", "enum": ["gcs", "cai"]},
+                 }, "required": ["timestamp"]}),
+
+            Tool(name="count_by_field",
+                 description=(
+                     "Aggregate log counts grouped by any field value. "
+                     "Examples: error count per service, log level distribution across a namespace, "
+                     "most active org IDs in the last hour. Returns a table sorted by count descending."
+                 ),
+                 inputSchema={"type": "object", "properties": {
+                     "field": {"type": "string", "description": "Field to group by, e.g. 'kubernetes.labels.app', 'dissect.catalina_out.level', 'kubernetes.namespace'"},
+                     "index_pattern": {"type": "string", "default": "filebeat-*-intcloud-*"},
+                     "range_minutes": {"type": "number", "default": 60},
+                     "max_buckets": {"type": "number", "default": 20, "description": "Max distinct values to return (max 100)"},
+                     "service": {"type": "string", "description": "Pre-filter to a specific service"},
+                     "level": {"type": "string", "enum": ["ERROR", "WARN", "INFO", "DEBUG"], "description": "Pre-filter to a log level"},
+                     "space": {"type": "string", "enum": ["gcs", "cai"]},
+                 }, "required": ["field"]}),
+
+            Tool(name="log_histogram",
+                 description=(
+                     "Count log entries over time in fixed-width buckets and render as a text bar chart. "
+                     "Useful for spotting error spikes, sustained failures, or confirming a problem is ongoing vs historical. "
+                     "E.g. 'show me error volume for vcs over the last 6 hours in 30-minute buckets'."
+                 ),
+                 inputSchema={"type": "object", "properties": {
+                     "index_pattern": {"type": "string", "default": "filebeat-*-intcloud-*"},
+                     "range_minutes": {"type": "number", "default": 360, "description": "How far back to show (default 6 hours)"},
+                     "interval": {"type": "string", "default": "30m", "description": "Bucket size: 1m, 5m, 15m, 30m, 1h, 6h, 1d"},
+                     "service": {"type": "string", "description": "Filter to a specific service"},
+                     "level": {"type": "string", "enum": ["ERROR", "WARN", "INFO", "DEBUG"]},
+                     "kql": {"type": "string", "description": "Additional KQL filter"},
+                     "space": {"type": "string", "enum": ["gcs", "cai"]},
+                 }}),
+
+            Tool(name="list_fields",
+                 description=(
+                     "Discover fields available in a log index. "
+                     "popular_only=true (default) samples 50 recent docs — fast, good for most queries. "
+                     "popular_only=false queries _field_caps for all indexed fields with their types — "
+                     "use when you need to find an exact field name. "
+                     "Use filter_pattern to narrow results, e.g. 'dissect' or 'kubernetes'."
+                 ),
+                 inputSchema={"type": "object", "properties": {
+                     "index_pattern": {"type": "string", "default": "filebeat-*-intcloud-*"},
+                     "filter_pattern": {"type": "string", "description": "Case-insensitive substring to filter field names"},
+                     "popular_only": {"type": "boolean", "default": True, "description": "True = fast sample scan; False = full field_caps (slow)"},
+                     "space": {"type": "string", "enum": ["gcs", "cai"]},
+                 }}),
         ]

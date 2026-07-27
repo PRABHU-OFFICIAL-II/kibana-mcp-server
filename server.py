@@ -65,7 +65,7 @@ async def start_http() -> None:
     app = Starlette(routes=[
         Route("/health", health),
         Route("/sse", handle_sse),
-        Mount("/messages/", app=handle_messages),
+        Route("/messages/", handle_messages, methods=["POST"]),
     ])
 
     print(f"[kibana-mcp] HTTP/SSE server on http://{HOST}:{PORT}", file=sys.stderr)

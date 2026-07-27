@@ -161,6 +161,145 @@ async def run_esql(query: str) -> Dict:
     return inner.get("rawResponse", inner)
 
 
+# ── Console proxy helpers (used by utility tools) ────────────────────────────
+
+async def _console_proxy_get(es_path: str, space: Optional[str] = None) -> Dict:
+    """Route an ES GET through Kibana's Dev Tools console proxy."""
+    s = space if space is not None else config.kibana.space_id
+    prefix = f"/s/{s}" if s else ""
+    return await kibana_get(f"{prefix}/api/console/proxy", params={"path": es_path, "method": "GET"})
+
+
+async def _console_proxy_post(es_path: str, body: Any, space: Optional[str] = None) -> Dict:
+    """Route an ES POST through Kibana's Dev Tools console proxy."""
+    s = space if space is not None else config.kibana.space_id
+    prefix = f"/s/{s}" if s else ""
+    return await kibana_post(f"{prefix}/api/console/proxy?path={es_path}&method=POST", body)
+
+
+async def count_by_field(
+    index_pattern: str,
+    field: str,
+    from_ms: int,
+    to_ms: int,
+    size: int = 20,
+    service: Optional[str] = None,
+    level: Optional[str] = None,
+    space: Optional[str] = None,
+) -> Dict:
+    filters: List[Dict] = [{"range": {"@timestamp": {"gte": from_ms, "lte": to_ms, "format": "epoch_millis"}}}]
+    if service:
+        filters.append({"term": {"kubernetes.labels.app.keyword": service}})
+    if level:
+        filters.append({"term": {"dissect.catalina_out.level.keyword": level.upper()}})
+    kw = field if field.endswith(".keyword") else f"{field}.keyword"
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": filters}},
+        "aggs": {"by_field": {"terms": {"field": kw, "size": size, "order": {"_count": "desc"}}}},
+    }
+    return await _console_proxy_post(f"/{index_pattern}/_search", body, space)
+
+
+async def get_log_histogram(
+    index_pattern: str,
+    from_ms: int,
+    to_ms: int,
+    interval: str = "30m",
+    service: Optional[str] = None,
+    level: Optional[str] = None,
+    kql: Optional[str] = None,
+    space: Optional[str] = None,
+) -> Dict:
+    filters: List[Dict] = [{"range": {"@timestamp": {"gte": from_ms, "lte": to_ms, "format": "epoch_millis"}}}]
+    must: List[Dict] = []
+    if service:
+        filters.append({"term": {"kubernetes.labels.app.keyword": service}})
+    if level:
+        filters.append({"term": {"dissect.catalina_out.level.keyword": level.upper()}})
+    if kql:
+        must.append({"query_string": {"query": kql, "default_field": "message"}})
+    query: Dict = {"bool": {"filter": filters}}
+    if must:
+        query["bool"]["must"] = must
+    body = {
+        "size": 0,
+        "query": query,
+        "aggs": {"over_time": {"date_histogram": {"field": "@timestamp", "fixed_interval": interval, "min_doc_count": 0}}},
+    }
+    return await _console_proxy_post(f"/{index_pattern}/_search", body, space)
+
+
+async def get_context_around(
+    index_pattern: str,
+    timestamp: str,
+    before: int = 20,
+    after: int = 20,
+    service: Optional[str] = None,
+    space: Optional[str] = None,
+) -> Dict:
+    """Return up to `before` docs before and `after` docs after a pivot timestamp."""
+    src_filters: List[Dict] = []
+    if service:
+        src_filters.append({"term": {"kubernetes.labels.app.keyword": service}})
+
+    def _q(order: str, op: str, count: int) -> Dict:
+        return {
+            "size": count,
+            "sort": [{"@timestamp": {"order": order}}],
+            "query": {"bool": {"filter": [{"range": {"@timestamp": {op: timestamp}}}, *src_filters]}},
+            "_source": True,
+        }
+
+    import asyncio
+    before_r, after_r = await asyncio.gather(
+        _console_proxy_post(f"/{index_pattern}/_search", _q("desc", "lt", before), space),
+        _console_proxy_post(f"/{index_pattern}/_search", _q("asc", "gt", after), space),
+    )
+    before_hits = list(reversed(before_r.get("hits", {}).get("hits", [])))
+    after_hits = after_r.get("hits", {}).get("hits", [])
+    return {"before": before_hits, "after": after_hits, "pivot": timestamp}
+
+
+async def list_fields(
+    index_pattern: str,
+    filter_pattern: Optional[str] = None,
+    popular_only: bool = True,
+    space: Optional[str] = None,
+) -> Dict:
+    if popular_only:
+        s = space if space is not None else config.kibana.space_id
+        prefix = f"/s/{s}" if s else ""
+        result = await kibana_post(f"{prefix}/api/console/proxy?path=/{index_pattern}/_search&method=POST", {
+            "size": 50, "sort": [{"@timestamp": {"order": "desc"}}], "_source": True,
+        })
+        hits = result.get("hits", {}).get("hits", [])
+        fields: set = set()
+
+        def _walk(obj: dict, pfx: str = "") -> None:
+            for k, v in obj.items():
+                full = f"{pfx}.{k}" if pfx else k
+                fields.add(full)
+                if isinstance(v, dict):
+                    _walk(v, full)
+                elif isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, dict):
+                            _walk(item, full)
+
+        for hit in hits:
+            _walk(hit.get("_source", {}))
+        if filter_pattern:
+            fields = {f for f in fields if filter_pattern.lower() in f.lower()}
+        return {"fields": sorted(fields), "source": "sample"}
+    else:
+        result = await _console_proxy_get(f"/{index_pattern}/_field_caps?fields=*", space)
+        raw = result.get("fields", {})
+        if filter_pattern:
+            raw = {k: v for k, v in raw.items() if filter_pattern.lower() in k.lower()}
+        return {"fields": {k: list(v.keys()) for k, v in sorted(raw.items()) if not k.startswith("_")}, "source": "field_caps"}
+
+
 # ── Alerts ────────────────────────────────────────────────────────────────────
 
 async def get_alert_rules(page: int = 1, per_page: int = 50) -> Dict:

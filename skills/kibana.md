@@ -103,6 +103,34 @@ If pods are crashing or restarting: run `mcp__kibana__investigate_pod_health(ser
 
 ---
 
+## The golden rule — reqid is the source of truth
+
+**For any investigation, always follow this sequence:**
+
+```
+1. FIND the specific event → search_logs with the exact identifier the user gave
+   (commit hash, object name, error text, endpoint, anything specific)
+   Use range_minutes=1440 (24h) as default — events may not be recent.
+   Sort asc to see the operation in sequence.
+
+2. EXTRACT the reqid → every meaningful log line has a reqid in the context block
+   dissect.catalina_out.reqid  OR  message field (look for reqid=... or [reqid:...])
+   If multiple reqids found, pick the one from the error or the operation entry point.
+
+3. TRACE the reqid → mcp__kibana__trace_request(reqid, range_minutes=1440)
+   This gives the full cross-service call chain for that specific request.
+   The error in this trace IS the root cause — nothing else.
+
+4. REPORT what the trace shows: which service threw the error, the error code/message,
+   the timestamp, and the reqid. That's the complete root cause.
+```
+
+**If step 1 returns 0 results** — say so and stop. State exactly what was searched and that no matching logs were found. Do NOT substitute errors from other operations, background jobs, or unrelated org activity as a replacement explanation. Errors from the same org that don't share a reqid with the reported operation are irrelevant noise.
+
+**If the trace in step 3 shows no errors** — the failure may be in a downstream service not logging to this index, or outside the log retention window. Say so explicitly.
+
+---
+
 ## Autonomous execution rules
 
 - **Never ask** "Can I run this query?" or "Should I check X?" — just do it.
@@ -114,7 +142,7 @@ If pods are crashing or restarting: run `mcp__kibana__investigate_pod_health(ser
   1. Try the other space (`gcs` ↔ `cai`)
   2. Broaden the time range (`--range 120` or `--range 240`)
   3. Try `search_logs` with `index_pattern="filebeat-*-intcloud-*"` and a broader KQL
-  4. Only then report "no data found" with what was tried
+  4. **If still 0:** say "no logs found" — do NOT substitute errors from other unrelated operations
 
 ---
 
@@ -147,23 +175,32 @@ If pods are crashing or restarting: run `mcp__kibana__investigate_pod_health(ser
 | `mcp__kibana__investigate_pod_health` | — | OOMKills, CrashLoopBackOff, evictions — when pods are crashing |
 | `mcp__kibana__compare_log_volume` | `service` | Error rate trend before/after a deployment or incident |
 
+### Utility tools — for deeper drill-down
+
+| Tool | Required params | When to use |
+|------|----------------|-------------|
+| `mcp__kibana__get_log_context` | `timestamp` | Fetch N lines before/after a specific log timestamp — understand what led to an error |
+| `mcp__kibana__count_by_field` | `field` | Aggregate by any field: error count per service, most active orgs, namespace distribution |
+| `mcp__kibana__log_histogram` | — | Text bar chart of log volume over time — spot spikes, confirm whether issue is ongoing |
+| `mcp__kibana__list_fields` | — | Discover field names in an index — use when a query returns 0 results and you suspect wrong field name |
+
 ---
 
 ## Scenario keyword → tool mapping
 
 | User says | Tools to run |
 |---|---|
+| specific event described (commit hash / object name / error text / endpoint) | `search_logs` to find it → extract reqid → `trace_request` — ALWAYS do this first |
+| specific reqid already known | `trace_request(reqid)` immediately — no search needed |
 | "errors" / "exceptions" / "failures" for a service | `investigate_service_errors` + `compare_log_volume` |
 | "what happened to" / "debug" a service | `investigate_service_errors` + `search_service_logs` (ERROR, last 60m) |
-| specific request ID / reqid | `trace_request(reqid)` — always |
-| specific org / tenant / customer | `search_by_org(org_id)` — always |
+| specific org / tenant / customer (no specific operation) | `search_by_org(org_id)` — always |
 | "pod crashing" / "OOMKill" / "restart" | `investigate_pod_health` + `investigate_service_errors` |
 | "deploy went wrong" / "did the release break anything" | `compare_log_volume` (before vs after window) + `investigate_service_errors` |
 | "slow" / "timeout" / "not responding" | `investigate_service_errors` (WARNs) + `search_service_logs` (level=WARN, range=60) |
-| "what is org X doing" / "customer issue" | `search_by_org` + optionally `trace_request` for any reqid found |
+| "what is org X doing" / "customer issue" | `search_by_org` + `trace_request` for any reqid found |
 | "overall health" / "status of service X" | `investigate_service_errors` + `compare_log_volume` + `investigate_pod_health` |
 | "how many errors" / "error rate" | `compare_log_volume` |
-| cross-service investigation | `trace_request` with reqid, then `search_by_org` if org is visible |
 
 ---
 
@@ -299,28 +336,35 @@ For raw `search_logs` or `run_esql` results: present them concisely with timesta
 ```
 auth_status → (login if expired)
   ↓
-STEP 1 — SPACE ROUTING:
+STEP 1 — DO I HAVE A SPECIFIC EVENT TO FIND?
+  User gave a specific identifier (commit hash, object name, error text, endpoint, etc.)?
+    YES → search_logs(kql='<identifier>', range_minutes=1440, sort_order="asc")
+          → extract reqid from the found log line
+          → trace_request(reqid, range_minutes=1440)
+          → report what the trace shows — that is the root cause, nothing else
+          → if 0 results: say "no logs found for <identifier>" and stop
+    NO  → continue to Step 2
+
+STEP 2 — SPACE ROUTING:
   Service starts with cai-/cai_/process-server/active-*? → space = "cai"
   All other services                                      → space = "gcs"
   No service / cross-service / org-only                   → search both
   ↓
-STEP 2 — INTENT MAPPING:
-  reqid present?      → trace_request immediately
-  org_id present?     → search_by_org immediately
-  service + errors?   → investigate_service_errors + compare_log_volume
-  pod instability?    → investigate_pod_health
-  post-deploy check?  → compare_log_volume + investigate_service_errors
-  general logs?       → search_service_logs with appropriate level/range
+STEP 3 — INTENT MAPPING:
+  reqid already known → trace_request immediately
+  org_id present      → search_by_org, then trace_request for any reqid found
+  service + errors    → investigate_service_errors + compare_log_volume
+  pod instability     → investigate_pod_health
+  post-deploy check   → compare_log_volume + investigate_service_errors
+  general logs        → search_service_logs with appropriate level/range
   ↓
-STEP 3 — DRILL DOWN:
-  Errors found → pick reqid from representative error → trace_request
-  Org visible  → search_by_org for full tenant context
+STEP 4 — DRILL DOWN:
+  Errors found → pick reqid → trace_request for full call chain
+  Org visible  → search_by_org for tenant context
   Pod events   → investigate_pod_health for crash/OOM details
-  Volume spike → compare_log_volume with wider window
   ↓
-STEP 4 — FILL GAPS:
+STEP 5 — FILL GAPS (only if genuinely no data):
   0 results in gcs → try cai (and vice versa)
   0 results in 60m → widen to 120m or 240m
-  Field missing    → try alternate field name (e.g. "message" vs "dissect.catalina_out.message")
-  Report what was tried if still no data
+  Still 0          → report exactly what was searched and that no data was found
 ```
