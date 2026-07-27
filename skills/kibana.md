@@ -39,10 +39,10 @@ If login fails or push is unavailable: ask the user to inject a session cookie i
 
 **Default space:** `gcs`
 
-**Space routing heuristic:**
-- Service name starts with `cai-`, `cai_`, `process-server`, `active-vcs`, `active-bpel` → use `cai` space
-- All other services (vcs, migration, frs, runtime, session-service, etc.) → use `gcs` space
-- When unsure → search both spaces in parallel, deduplicate by `_id`
+**Space routing rules (applied automatically — never search both in parallel):**
+- Service or query contains `cai-`, `cai_`, `process-server`, `active-vcs`, `active-bpel`, or `cai` keyword → `cai` space only
+- Everything else → `global` first; if 0 results → fall back to `gcs`
+- User explicitly passes `space=` → always honour it
 
 **Primary index patterns (filebeat intcloud logs):**
 - `filebeat-*-intcloud-*` — main application logs (CDI + CAI services)
@@ -75,16 +75,17 @@ If login fails or push is unavailable: ask the user to inject a session cookie i
 
 ## Step 1 — Space routing before any log query
 
-**Never hardcode a space. Always route first.**
+**Never hardcode a space. Never search both spaces in parallel. Always route first.**
 
 ```
-Does the service name start with cai-, cai_, process-server, active-vcs, active-bpel?
-  YES → space = "cai"
-  NO  → space = "gcs"
-  UNSURE (no service name, org-only query, or cross-service) → search BOTH spaces in parallel
+Does the service/query contain cai-, cai_, process-server, active-vcs, active-bpel, or "cai" keyword?
+  YES → space = "cai"  (search cai only)
+  NO  → search "global" first
+          → got results? use them
+          → 0 results? fall back to "gcs"
 ```
 
-When searching both spaces, results are automatically deduplicated by document `_id` — the same ES document will not appear twice.
+This is handled automatically by the tools — you never need to specify a space unless you want to force one.
 
 ---
 
@@ -100,6 +101,35 @@ mcp__kibana__compare_log_volume(service, baseline_minutes=60, comparison_minutes
 If the user provides a request ID: also run `mcp__kibana__trace_request(reqid)` immediately.
 If the user provides an org/tenant ID: also run `mcp__kibana__search_by_org(org_id)`.
 If pods are crashing or restarting: run `mcp__kibana__investigate_pod_health(service)`.
+
+---
+
+## Timezone — ALWAYS IST (UTC+5:30)
+
+**All timestamps in every query and every response must be in IST (Indian Standard Time = UTC+5:30).**
+
+Before firing any query:
+1. If the user gives a time in any other timezone (UTC, PDT, EST, etc.) → convert to IST first, then use that IST value in the query.
+2. If the user gives a time already in IST → use as-is.
+3. If no time given → default to IST "now" (`now` in Kibana always reflects the server clock; just make sure any displayed times are converted to IST before showing the user).
+
+When displaying results:
+- All `@timestamp` values from Kibana come back as UTC. **Convert every timestamp to IST before showing it to the user.** Never show a raw UTC timestamp in the final answer.
+- Format: `YYYY-MM-DD HH:MM:SS IST`
+- Example: `2026-07-27T08:30:00.000Z` → `2026-07-27 14:00:00 IST`
+
+Conversion formula: **IST = UTC + 5 hours 30 minutes**
+
+Quick reference:
+| UTC | IST |
+|---|---|
+| 00:00 | 05:30 |
+| 06:00 | 11:30 |
+| 12:00 | 17:30 |
+| 18:00 | 23:30 |
+| 18:30 | 00:00 next day |
+
+When using `range_minutes` in tool calls, no conversion is needed — relative ranges (`now-60m`, etc.) are timezone-agnostic. Conversion is only needed when displaying absolute timestamps to the user or when the user provides an absolute time as input.
 
 ---
 
@@ -345,10 +375,9 @@ STEP 1 — DO I HAVE A SPECIFIC EVENT TO FIND?
           → if 0 results: say "no logs found for <identifier>" and stop
     NO  → continue to Step 2
 
-STEP 2 — SPACE ROUTING:
-  Service starts with cai-/cai_/process-server/active-*? → space = "cai"
-  All other services                                      → space = "gcs"
-  No service / cross-service / org-only                   → search both
+STEP 2 — SPACE ROUTING (automatic — tools handle this):
+  Service/query contains cai-/cai_/process-server/active-*/cai keyword? → cai only
+  Everything else → global first, fall back to gcs if 0 results
   ↓
 STEP 3 — INTENT MAPPING:
   reqid already known → trace_request immediately

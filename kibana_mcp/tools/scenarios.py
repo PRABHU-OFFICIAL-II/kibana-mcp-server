@@ -131,16 +131,55 @@ async def _search_both_spaces(
     return {"gcs": gcs, "cai": cai}
 
 
-def _pick_space(service: Optional[str], explicit_space: Optional[str]) -> Optional[str]:
-    """Heuristic: CAI services go to cai space, CDI/other go to gcs."""
+_CAI_PREFIXES = ("cai-", "cai_", "iics-cai", "process-server", "active-vcs", "active-bpel")
+_CAI_KEYWORDS = ("active-bpel", "active-vcs", "process-server", "cai")
+
+
+def _is_cai(service: Optional[str], kql: Optional[str] = None) -> bool:
+    """Return True when the query is clearly CAI-specific."""
+    if service and any(service.lower().startswith(p) for p in _CAI_PREFIXES):
+        return True
+    if kql:
+        kql_lower = kql.lower()
+        if any(k in kql_lower for k in _CAI_KEYWORDS):
+            return True
+    return False
+
+
+def _pick_space(service: Optional[str], explicit_space: Optional[str],
+                kql: Optional[str] = None) -> Optional[str]:
+    """
+    Routing rules:
+      - explicit space given → use it
+      - CAI service / CAI keyword in query → "cai"
+      - everything else → None (caller uses global-first fallback)
+    """
     if explicit_space:
         return explicit_space
-    if not service:
-        return None  # caller will search both
-    cai_prefixes = ("cai-", "cai_", "iics-cai", "process-server", "active-vcs", "active-bpel")
-    if any(service.lower().startswith(p) for p in cai_prefixes):
+    if _is_cai(service, kql):
         return "cai"
-    return "gcs"
+    return None  # triggers global → gcs fallback
+
+
+async def _search_global_then_gcs(
+    index_pattern: str,
+    kql: str,
+    from_ms: int,
+    to_ms: int,
+    size: int = 200,
+    sort_order: str = "desc",
+) -> Tuple[str, dict]:
+    """
+    Search 'global' space first. If 0 hits, fall back to 'gcs'.
+    Returns (space_used, result).
+    """
+    result = await _search_space("global", index_pattern, kql, from_ms, to_ms, size, sort_order)
+    total, _ = _hits_from_bsearch(result)
+    if total > 0:
+        return "global", result
+    # Fall back to gcs
+    result = await _search_space("gcs", index_pattern, kql, from_ms, to_ms, size, sort_order)
+    return "gcs", result
 
 
 # ── Investigation Functions ────────────────────────────────────────────────────
@@ -156,7 +195,6 @@ async def investigate_service_errors(
 ) -> str:
     """Find recent ERROR/EXCEPTION log lines for a specific microservice."""
     from_ms, to_ms = _resolve_time_range(range_minutes, from_ms, to_ms)
-    chosen_space = _pick_space(service, space)
 
     kql_parts = [
         f'kubernetes.labels.app: "{service}"',
@@ -166,21 +204,19 @@ async def investigate_service_errors(
         kql_parts.append(f'"{org}"')
     kql = " AND ".join(kql_parts)
 
+    chosen_space = _pick_space(service, space, kql)
     if chosen_space:
         result = await _search_space(chosen_space, "filebeat-*-intcloud-*", kql, from_ms, to_ms, size)
-        spaces_searched = [chosen_space]
-        results_by_space = {chosen_space: result}
+        space_used, results_by_space = chosen_space, {chosen_space: result}
     else:
-        results_by_space = await _search_both_spaces("filebeat-*-intcloud-*", kql, from_ms, to_ms, size // 2)
-        spaces_searched = list(results_by_space.keys())
+        space_used, result = await _search_global_then_gcs("filebeat-*-intcloud-*", kql, from_ms, to_ms, size)
+        results_by_space = {space_used: result}
 
     lines = [
         f"Service error investigation: {service}",
-        f"Time range: {from_ms} — {to_ms} (epoch ms)",
-        f"Spaces: {', '.join(spaces_searched)}",
+        f"Space: {space_used}",
         "",
     ]
-
     for sp, result in results_by_space.items():
         total, docs = _hits_from_bsearch(result)
         lines.append(f"[{sp.upper()}] {total} matching events (showing {len(docs)})")
@@ -202,20 +238,18 @@ async def trace_request(
     """Trace a request ID across all services to reconstruct the full call chain."""
     from_ms, to_ms = _resolve_time_range(range_minutes, from_ms, to_ms)
 
-    # reqid appears in the structured context block in the message field
     kql = f'dissect.catalina_out.reqid: "{reqid}" OR message: "{reqid}"'
 
     if space:
         result = await _search_space(space, "filebeat-*-intcloud-*", kql, from_ms, to_ms, size, "asc")
         results_by_space = {space: result}
     else:
-        gcs = asyncio.create_task(_search_space("gcs", "filebeat-*-intcloud-*", kql, from_ms, to_ms, size // 2, "asc"))
-        cai = asyncio.create_task(_search_space("cai", "filebeat-*-intcloud-*", kql, from_ms, to_ms, size // 2, "asc"))
-        gcs_r, cai_r = await asyncio.gather(gcs, cai, return_exceptions=True)
-        results_by_space = {
-            "gcs": gcs_r if not isinstance(gcs_r, Exception) else {},
-            "cai": cai_r if not isinstance(cai_r, Exception) else {},
-        }
+        # reqid traces need to be comprehensive — try global first, fall back to gcs.
+        # If the reqid spans CAI services too, the user should pass space="cai" explicitly.
+        space_used, result = await _search_global_then_gcs(
+            "filebeat-*-intcloud-*", kql, from_ms, to_ms, size, "asc"
+        )
+        results_by_space = {space_used: result}
 
     all_docs = []
     seen_ids = set()
@@ -238,9 +272,10 @@ async def trace_request(
 
     all_docs.sort(key=ts_key)
 
+    spaces_label = ", ".join(sorted(results_by_space.keys()))
     lines = [
         f"Request trace: {reqid}",
-        f"Time range: {from_ms} — {to_ms} (epoch ms)",
+        f"Space: {spaces_label}",
         f"Total events: {len(all_docs)}",
         "",
     ]
@@ -287,14 +322,14 @@ async def search_by_org(
     if space:
         result = await _search_space(space, "filebeat-*-intcloud-*", kql, from_ms, to_ms, size)
         results_by_space = {space: result}
+    elif _is_cai(None, kql):
+        result = await _search_space("cai", "filebeat-*-intcloud-*", kql, from_ms, to_ms, size)
+        results_by_space = {"cai": result}
     else:
-        results_by_space = await _search_both_spaces("filebeat-*-intcloud-*", kql, from_ms, to_ms, size // 2)
+        space_used, result = await _search_global_then_gcs("filebeat-*-intcloud-*", kql, from_ms, to_ms, size)
+        results_by_space = {space_used: result}
 
-    lines = [
-        f"Org search: {org_id}",
-        f"Time range: {from_ms} — {to_ms} (epoch ms)",
-        "",
-    ]
+    lines = [f"Org search: {org_id}", ""]
     for sp, result in results_by_space.items():
         total, docs = _hits_from_bsearch(result)
         lines.append(f"[{sp.upper()}] {total} events (showing {len(docs)})")
@@ -420,7 +455,6 @@ async def search_service_logs(
     Filters by service (kubernetes.labels.app), optionally by level, org, namespace, cluster.
     """
     from_ms, to_ms = _resolve_time_range(range_minutes, from_ms, to_ms)
-    chosen_space = _pick_space(service, space)
 
     kql_parts = [f'kubernetes.labels.app: "{service}"']
     if level:
@@ -435,24 +469,21 @@ async def search_service_logs(
         kql_parts.append(f"({kql})")
     final_kql = " AND ".join(kql_parts)
 
+    chosen_space = _pick_space(service, space, final_kql)
     if chosen_space:
         result = await _search_space(chosen_space, "filebeat-*-intcloud-*", final_kql, from_ms, to_ms, size)
-        results_by_space = {chosen_space: result}
+        space_used = chosen_space
     else:
-        results_by_space = await _search_both_spaces("filebeat-*-intcloud-*", final_kql, from_ms, to_ms, size // 2)
+        space_used, result = await _search_global_then_gcs("filebeat-*-intcloud-*", final_kql, from_ms, to_ms, size)
 
+    total, docs = _hits_from_bsearch(result)
     lines = [
         f"Service logs: {service}" + (f" [{level.upper()}]" if level else ""),
-        f"Time range: last {range_minutes} minutes",
-        f"Spaces: {', '.join(results_by_space.keys())}",
+        f"Space: {space_used}",
+        f"{total} events (showing {len(docs)})",
         "",
     ]
-
-    for sp, result in results_by_space.items():
-        total, docs = _hits_from_bsearch(result)
-        lines.append(f"[{sp.upper()}] {total} events (showing {len(docs)})")
-        for doc in docs:
-            lines.append(f"  {_format_hit(doc)}")
-        lines.append("")
+    for doc in docs:
+        lines.append(f"  {_format_hit(doc)}")
 
     return "\n".join(lines)
