@@ -21,12 +21,19 @@ HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 
 
 async def warm_up_session() -> None:
-    try:
-        session = await get_session()
-        expires_in = round((session.expires_at - __import__("time").time() * 1000) / 60000)
-        print(f"[kibana-mcp] Session ready, expires in {expires_in} minutes", file=sys.stderr)
-    except Exception as e:
-        print(f"[kibana-mcp] ⚠️  Session setup failed: {e}", file=sys.stderr)
+    # Only peek at the saved session — never trigger a browser login at startup.
+    # The self-healing login fires on the first actual tool call instead.
+    import time
+    from kibana_mcp.auth.session import load_session
+    session = load_session()
+    if session:
+        expires_in = round((session.expires_at - time.time() * 1000) / 60000)
+        if expires_in > 0:
+            print(f"[kibana-mcp] Session ready, expires in {expires_in} minutes", file=sys.stderr)
+        else:
+            print(f"[kibana-mcp] Saved session expired — will re-authenticate on first tool call", file=sys.stderr)
+    else:
+        print(f"[kibana-mcp] No session found — will open browser on first tool call", file=sys.stderr)
 
 
 async def start_stdio() -> None:
