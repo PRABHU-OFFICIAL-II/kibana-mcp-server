@@ -11,7 +11,6 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), overrid
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
-from kibana_mcp.auth.manager import get_session
 from kibana_mcp.config import config
 from kibana_mcp.tools.index import register_tools
 
